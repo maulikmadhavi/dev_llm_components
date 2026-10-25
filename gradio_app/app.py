@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from PIL import Image
+from PIL import Image, ImageDraw
 from pydantic import BaseModel, Field
 
 from components import OUTPUT_DIR, NodeError, media_path, run_node, save_upload, specs
@@ -86,19 +86,32 @@ def param_component(p: dict, key: str):
     label, default = p["label"], p["default"]
     match p["kind"]:
         case "textarea":
-            return gr.Textbox(label=label, value=default, lines=3, key=key)
+            return gr.Textbox(label=label, value=default, lines=3, key=key, interactive=True)
         case "number":
-            return gr.Number(label=label, value=default, key=key)
+            return gr.Number(label=label, value=default, key=key, interactive=True)
+        case "select":
+            return gr.Dropdown(p["options"], label=label, value=default, key=key, interactive=True)
         case "password":
-            return gr.Textbox(label=label, value=default, type="password", key=key)
+            return gr.Textbox(label=label, value=default, type="password", key=key, interactive=True)
         case "file":
             return gr.File(label=label, type="filepath", file_types=gr_file_types(p.get("accept")), key=key)
         case _:
-            return gr.Textbox(label=label, value=default, key=key)
+            return gr.Textbox(label=label, value=default, key=key, interactive=True)
 
 
 def to_image(data_url: str) -> Image.Image:
     return Image.open(io.BytesIO(base64.b64decode(data_url.split(",", 1)[1])))
+
+
+def draw_boxes(det: dict) -> Image.Image:
+    img = (Image.open(media_path(det["path"])) if det.get("path") else to_image(det["image"])).convert("RGB")
+    d = ImageDraw.Draw(img)
+    w, h = img.size
+    for b in det["boxes"]:
+        x1, y1, x2, y2 = b["box"]
+        d.rectangle([x1 * w, y1 * h, x2 * w, y2 * h], outline="#d946ef", width=3)
+        d.text((x1 * w + 4, y1 * h + 2), b["label"], fill="#d946ef")
+    return img
 
 
 def summarize(spec: dict, outputs: dict):
@@ -125,6 +138,9 @@ def summarize(spec: dict, outputs: dict):
                 lines.append(f"{len(value)} videos: " + "; ".join(f"{v['name']} ({v['duration']}s)" for v in value[:8]))
             case "results":
                 lines += [f"{len(value)} results:"] + [f"- {r['name']}: {r['text'][:160]}" for r in value[:8]]
+            case "detections":
+                lines.append(f"{sum(len(d['boxes']) for d in value)} boxes in {len(value)} images")
+                gallery += [(draw_boxes(d), d["name"]) for d in value[:12]]
             case "file":
                 lines.append(f"Wrote {value['rows']} rows to {OUTPUT_DIR / value['name']}")
     return "\n".join(lines), gr.update(value=gallery or None, visible=bool(gallery))

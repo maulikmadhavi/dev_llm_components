@@ -58,6 +58,16 @@ function ParamField({ param, data, onChange, onFile, uploading, uploadError }) {
       </label>
     );
   }
+  if (param.kind === 'select') {
+    return (
+      <label className="block">
+        {label}
+        <select className={`${inputCls} nodrag`} value={value ?? param.default} onChange={(e) => onChange(param.name, e.target.value)}>
+          {param.options.map((o) => <option key={o} value={o}>{o}</option>)}
+        </select>
+      </label>
+    );
+  }
   return (
     <label className="block">
       {label}
@@ -145,6 +155,29 @@ function Preview({ port, value }) {
             </div>
           ))}
           {arr.length > 20 && <p className="text-slate-400">+{arr.length - 20} more</p>}
+        </div>
+      </div>
+    );
+  } else if (port.type === 'detections') {
+    const arr = Array.isArray(value) ? value : [];
+    body = (
+      <div>
+        <p className="text-xs text-slate-600">{arr.reduce((n, d) => n + d.boxes.length, 0)} boxes in {arr.length} images</p>
+        <div className="nowheel mt-1 flex gap-1 overflow-x-auto">
+          {arr.slice(0, 4).map((d, i) => (
+            <div key={`${d.name}-${i}`} className="relative inline-block shrink-0">
+              <img
+                src={d.path ? `${API_BASE}/api/media?path=${encodeURIComponent(d.path)}` : d.image}
+                alt={d.name} title={d.name} className="block h-24 rounded"
+              />
+              {d.boxes.map((b, j) => (
+                <span
+                  key={j} title={b.label} className="absolute border-2 border-fuchsia-500"
+                  style={{ left: `${b.box[0] * 100}%`, top: `${b.box[1] * 100}%`, width: `${(b.box[2] - b.box[0]) * 100}%`, height: `${(b.box[3] - b.box[1]) * 100}%` }}
+                />
+              ))}
+            </div>
+          ))}
         </div>
       </div>
     );

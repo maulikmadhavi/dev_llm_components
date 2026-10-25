@@ -6,6 +6,7 @@ export const TYPE_COLORS = {
   images: '#14b8a6',
   videos: '#f97316',
   results: '#8b5cf6',
+  detections: '#d946ef',
   file: '#0ea5e9',
 };
 

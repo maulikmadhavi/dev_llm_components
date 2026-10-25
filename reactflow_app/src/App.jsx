@@ -36,7 +36,7 @@ function Flow({ specs }) {
     const params = {};
     for (const p of spec.params) params[p.name] = p.default;
     addNodes({
-      id: `${type}_${Date.now().toString(36)}`,
+      id: `${type}_${Math.random().toString(36).slice(2, 8)}`,
       type: 'ai',
       position: screenToFlowPosition({ x: e.clientX, y: e.clientY }),
       data: { type, params, fileNames: {}, status: 'idle', error: '', result: {} },

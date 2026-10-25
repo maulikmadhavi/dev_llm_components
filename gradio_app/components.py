@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import base64
 import csv
+import json
 import math
 import re
 import shutil
 import uuid
+from collections import Counter
 from pathlib import Path
 
 import cv2
@@ -386,6 +388,224 @@ def run_llm(params, inputs):
     return {"text": chat(params, f"{instruction}\n\n{inputs['text']}".strip())}
 
 
+def _decode_data_url(url: str):
+    return cv2.imdecode(np.frombuffer(base64.b64decode(url.split(",", 1)[1]), dtype=np.uint8), cv2.IMREAD_COLOR)
+
+
+def _load_bgr(item: dict):
+    """Full-resolution pixels for a list item ({path}) or a single-image item ({image: data URL})."""
+    if item.get("path"):
+        path = media_path(item["path"])
+        img = cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_COLOR)
+    elif item.get("image"):
+        img = _decode_data_url(item["image"])
+    else:
+        raise NodeError("Item has no image.")
+    if img is None:
+        raise NodeError(f"Could not decode image: {item.get('name', '')}")
+    return img
+
+
+def _json_lists(text: str):
+    """Yield each JSON list of objects found in `text` (tolerates prose, <think> blocks, several lists)."""
+    dec = json.JSONDecoder()
+    for m in re.finditer(r"\[", text):
+        try:
+            val, _ = dec.raw_decode(text[m.start():])
+        except ValueError:
+            continue
+        if isinstance(val, list) and all(isinstance(v, dict) for v in val):
+            yield val
+
+
+def _box_item(d: dict, scale: float = 1000) -> dict | None:
+    """Normalise one {bbox_2d|bbox|box, label, score} dict to 0-1 coordinates; None if unusable."""
+    coords = d.get("bbox_2d") or d.get("bbox") or d.get("box")
+    try:
+        x1, y1, x2, y2 = (min(max(float(v) / scale, 0.0), 1.0) for v in coords)
+        score = d.get("score", d.get("confidence"))
+        score = float(score) if score is not None else None
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) for v in (x1, y1, x2, y2)) or x2 <= x1 or y2 <= y1:
+        return None
+    return {"label": str(d.get("label") or d.get("name") or "object"), "score": score,
+            "box": [round(x1, 4), round(y1, 4), round(x2, 4), round(y2, 4)]}
+
+
+def _parse_boxes(text: str, max_boxes: int) -> list[dict]:
+    """Pull [{bbox_2d:[x1,y1,x2,y2], label}] (Qwen-VL style, 0-1000 coordinates) out of a model reply."""
+    raw = next(_json_lists(text), None)
+    if raw is None:  # e.g. a reply cut off by max_tokens: salvage the complete objects
+        dec, raw = json.JSONDecoder(), []
+        for m in re.finditer(r"\{", text):
+            try:
+                val, _ = dec.raw_decode(text[m.start():])
+            except ValueError:
+                continue
+            if isinstance(val, dict) and any(k in val for k in ("bbox_2d", "bbox", "box")):
+                raw.append(val)
+        if not raw:
+            raise NodeError(f"The model did not return a JSON list of boxes: {text[:200]}")
+    return [b for b in map(_box_item, raw) if b][:max_boxes]
+
+
+def run_object_detector(params, inputs):
+    """Ask a VLM for boxes. `detections` items are {name, path|image, boxes:[{label, score, box (0-1 x1,y1,x2,y2)}], meta}."""
+    if inputs.get("images"):
+        items = [{"name": i["name"], "path": i["path"], "meta": i.get("meta", {})} for i in inputs["images"]]
+    elif inputs.get("image"):
+        items = [{"name": "image", "image": inputs["image"], "meta": {}}]
+    else:
+        raise NodeError("Connect an image or images.")
+    labels = (params.get("labels") or "").strip()
+    target = f"every instance of: {labels}" if labels else "all distinct objects"
+    prompt = (f"Detect {target}. Reply with only a JSON list like "
+              '[{"bbox_2d": [x1, y1, x2, y2], "label": "name"}] using integer coordinates from 0 to 1000 '
+              "relative to the image width and height. Reply [] if nothing is found.")
+    max_boxes = max(int(params.get("max_boxes") or 20), 1)
+    detections, lines = [], []
+    for it in items:
+        url = image_data_url(it["path"]) if it.get("path") else it["image"]
+        boxes = _parse_boxes(chat(params, [{"type": "text", "text": prompt}, _image_part(url)]), max_boxes)
+        detections.append({**it, "boxes": boxes})
+        lines.append(f"{it['name']}: " + (", ".join(b["label"] for b in boxes) or "no objects"))
+    return {"detections": detections, "text": "\n".join(lines)}
+
+
+def run_image_crop(params, inputs):
+    """Crop each detected box (loose adds a margin around each box), or one fixed fractional region per image when nothing is detected."""
+    if inputs.get("detections"):
+        wanted = {s.strip().lower() for s in (params.get("labels") or "").split(",") if s.strip()}
+        min_score = float(params.get("min_score") or 0)
+        try:
+            margin = float(params.get("margin") if params.get("margin") not in (None, "") else 20)
+        except (TypeError, ValueError) as e:
+            raise NodeError("Margin must be a number (percent).") from e
+        pad = max(margin, 0.0) / 100 if (params.get("mode") or "loose") == "loose" else 0.0  # each side, relative to box size
+        regions = []
+        for d in inputs["detections"]:
+            d.setdefault("name", "image")
+            for raw_box in d.get("boxes") or []:
+                b = _box_item({**raw_box, "box": raw_box.get("box")}, scale=1)
+                if b and (not wanted or b["label"].lower() in wanted) and (b["score"] is None or b["score"] >= min_score):
+                    regions.append((d, b))
+        if not regions:
+            raise NodeError("No boxes matched the label/score filter.")
+    else:
+        if inputs.get("images"):
+            sources = inputs["images"]
+        elif inputs.get("image"):
+            sources = [{"name": "image", "image": inputs["image"], "meta": {}}]
+        else:
+            raise NodeError("Connect detections, an image or images.")
+        try:
+            x, y, w, h = (min(max(float(params.get(k) if params.get(k) not in (None, "") else d), 0.0), 1.0)
+                          for k, d in (("x", 0.25), ("y", 0.25), ("w", 0.5), ("h", 0.5)))
+        except (TypeError, ValueError) as e:
+            raise NodeError("Crop x, y, w and h must be numbers.") from e
+        if w <= 0 or h <= 0:
+            raise NodeError("Crop width and height must be above 0.")
+        pad = 0.0
+        regions = [(s, {"label": "crop", "score": None, "box": [x, y, min(x + w, 1.0), min(y + h, 1.0)]}) for s in sources]
+
+    max_crops = 200
+    if len(regions) > max_crops:
+        regions = regions[:max_crops]
+    cache: dict[str, object] = {}
+    crops = []
+    for i, (src, b) in enumerate(regions):
+        key = src.get("path") or src["name"]
+        if key not in cache:
+            cache[key] = _load_bgr(src)
+        img = cache[key]
+        H, W = img.shape[:2]
+        x1, y1, x2, y2 = b["box"]
+        px, py = (x2 - x1) * pad, (y2 - y1) * pad
+        l, t = int(max(x1 - px, 0) * W), int(max(y1 - py, 0) * H)
+        r, btm = int(math.ceil(min(x2 + px, 1) * W)), int(math.ceil(min(y2 + py, 1) * H))
+        if r - l < 2 or btm - t < 2:
+            continue
+        ok, buf = cv2.imencode(".jpg", img[t:btm, l:r], [cv2.IMWRITE_JPEG_QUALITY, 92])
+        dest = UPLOAD_DIR / f"crop_{uuid.uuid4().hex[:10]}.jpg"
+        dest.write_bytes(buf.tobytes())
+        stem = Path(src["name"]).stem
+        label = re.sub(r"\W+", "_", b["label"]).strip("_") or "crop"
+        meta = {**src.get("meta", {}), "source": src["name"], "label": b["label"]}
+        if b.get("score") is not None:
+            meta["score"] = b["score"]
+        item = _image_item(dest, meta)
+        item["name"] = f"{stem}_{label}_{i}.jpg"
+        crops.append(item)
+    if not crops:
+        raise NodeError("All crops were empty.")
+    return {"images": crops, "image": image_data_url(crops[0]["path"])}
+
+
+def _norm_answer(t: str) -> str:
+    return re.sub(r"\W+", " ", t.lower()).strip()
+
+
+def _fuse_one(params: dict, candidates: list[str], image_url: str | None) -> tuple[str, float]:
+    """Combine candidate answers. Returns (decision, share of candidates that agree with it)."""
+    method = params.get("method") or "judge"
+    counts = Counter(_norm_answer(c) for c in candidates)
+    top, n = counts.most_common(1)[0]
+    if method == "first":
+        decision = candidates[0]
+    elif method == "majority":
+        decision = next(c for c in candidates if _norm_answer(c) == top) if n > 1 else candidates[0]
+    elif method == "judge":
+        listing = "\n\n".join(f"Candidate {i + 1}:\n{c}" for i, c in enumerate(candidates))
+        task = (params.get("instruction") or "").strip()
+        look = " Use the image to check which candidate is correct." if image_url else ""
+        prompt = (f"{task}\n\nSeveral models answered the same task.{look} Decide the final answer.\n\n{listing}\n\n"
+                  "Write the final answer text itself (copy the best candidate or merge them). "
+                  "Do not mention candidate numbers and add no commentary.").strip()
+        decision = chat(params, [{"type": "text", "text": prompt}, _image_part(image_url)] if image_url else prompt)
+        # Small models sometimes reply "Candidate 2" anyway: map that back to the candidate's text.
+        pick = re.fullmatch(r"(?:candidate\s*)?(\d+)\W*", decision.strip(), re.I)
+        if pick and 1 <= int(pick.group(1)) <= len(candidates):
+            decision = candidates[int(pick.group(1)) - 1]
+        elif _norm_answer(decision) not in counts:
+            return decision, None  # rewritten answer: agreement is undefined
+    else:
+        raise NodeError(f"Unknown fusion method: {method}")
+    return decision, round(counts[_norm_answer(decision)] / len(candidates), 3)
+
+
+def _fuse(params: dict, lists: list[list[dict]], images: list[str | None] | None = None) -> dict:
+    """Fuse aligned result lists item by item (aligned by position)."""
+    lists = [l for l in lists if l]
+    if len(lists) < 2:
+        raise NodeError("Connect at least two candidate inputs.")
+    if len({len(l) for l in lists}) > 1:
+        raise NodeError("Candidate lists have different lengths: " + ", ".join(str(len(l)) for l in lists))
+    results = []
+    for i, group in enumerate(zip(*lists)):
+        url = images[i] if images and i < len(images) else None
+        decision, agreement = _fuse_one(params, [g.get("text") or "" for g in group], url)
+        results.append({"name": group[0].get("name") or f"item_{i + 1}", "path": group[0].get("path", ""), "text": decision,
+                        "meta": {**group[0].get("meta", {}), "agreement": agreement, "candidates": len(group)}})
+    text = results[0]["text"] if len(results) == 1 else "\n\n".join(f"{r['name']}:\n{r['text']}" for r in results)
+    return {"text": text, "results": results}
+
+
+def run_llm_decision_fusion(params, inputs):
+    lists = [[{"name": "text", "path": "", "text": inputs[k], "meta": {}}] for k in ("a", "b", "c") if inputs.get(k)]
+    lists += [inputs[k] for k in ("results_a", "results_b", "results_c") if inputs.get(k)]
+    return _fuse(params, lists)
+
+
+def run_vlm_decision_fusion(params, inputs):
+    lists = [inputs[k] for k in ("results_a", "results_b", "results_c") if inputs.get(k)]
+    if inputs.get("images"):
+        urls = [image_data_url(i["path"]) for i in inputs["images"]] if (params.get("method") or "judge") == "judge" else None
+    else:
+        urls = [inputs["image"]] if inputs.get("image") else None
+    return _fuse(params, lists, urls)
+
+
 # ---------- registry ----------
 
 def P(name, label, kind="text", default="", **extra):
@@ -464,6 +684,41 @@ NODES = {
         label="CSV Writer (Video)", icon="📼", category="Outputs", inputs=[port("results", "results")],
         outputs=[port("file", "file")],
         params=[P("filename", "File name", default="video_results.csv")], run=run_csv_writer_video),
+    "object_detector": dict(
+        label="Object Detector", icon="🎯", category="Models",
+        inputs=[port("image", "image", True), port("images", "images", True)],
+        outputs=[port("detections", "detections"), port("text", "text")],
+        params=[P("labels", "Objects to find (comma-separated, blank = all)"), P("max_boxes", "Max boxes per image", "number", 20)]
+        + model_params("qwen3-vl-4b"),
+        run=run_object_detector),
+    "image_crop": dict(
+        label="Image Crop", icon="🔲", category="Processing",
+        inputs=[port("detections", "detections", True), port("image", "image", True), port("images", "images", True)],
+        outputs=[port("images", "images"), port("image", "image")],
+        params=[P("labels", "Only these labels (comma-separated, blank = all)"), P("min_score", "Min score", "number", 0, step=0.05),
+                P("mode", "Crop mode", "select", "loose", options=["loose", "tight"]),
+                P("margin", "Loose margin (% of box size, each side)", "number", 20, step=5),
+                P("x", "No detections: left (0-1)", "number", 0.25, step=0.05), P("y", "No detections: top (0-1)", "number", 0.25, step=0.05),
+                P("w", "No detections: width (0-1)", "number", 0.5, step=0.05), P("h", "No detections: height (0-1)", "number", 0.5, step=0.05)],
+        run=run_image_crop),
+    "vlm_decision_fusion": dict(
+        label="VLM Decision Fusion", icon="⚖️", category="Models",
+        inputs=[port("results_a", "results"), port("results_b", "results"), port("results_c", "results", True),
+                port("image", "image", True), port("images", "images", True)],
+        outputs=[port("text", "text"), port("results", "results")],
+        params=[P("method", "Method", "select", "judge", options=["judge", "majority", "first"]),
+                P("instruction", "Task the candidates answered", "textarea", "Which answer is most accurate for this image?")]
+        + model_params("qwen3-vl-4b"),
+        run=run_vlm_decision_fusion),
+    "llm_decision_fusion": dict(
+        label="LLM Decision Fusion", icon="🧮", category="Models",
+        inputs=[port("a", "text", True), port("b", "text", True), port("c", "text", True),
+                port("results_a", "results", True), port("results_b", "results", True), port("results_c", "results", True)],
+        outputs=[port("text", "text"), port("results", "results")],
+        params=[P("method", "Method", "select", "judge", options=["judge", "majority", "first"]),
+                P("instruction", "Task the candidates answered", "textarea", "Pick the best-supported answer, or merge them if they complement each other.")]
+        + model_params("qwen/qwen3-4b"),
+        run=run_llm_decision_fusion),
     "llm": dict(
         label="LLM", icon="💬", category="Models", inputs=[port("text", "text")], outputs=[port("text", "text")],
         params=[P("instruction", "Instruction", "textarea", "Summarize in one sentence:")] + model_params("qwen/qwen3-4b"),
