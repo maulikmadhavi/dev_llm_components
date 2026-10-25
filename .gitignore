@@ -13,3 +13,4 @@ Qwen2.5-0.5B-DPO/runs/Jul20_01-07-43_maulik-pc/events.out.tfevents.1752944865.ma
 n8n/out.data
 vid_data/
 data/car_accident/
+__pycache__/

@@ -1,0 +1,16 @@
+[workspace]
+name = "gradio_app"
+channels = ["conda-forge"]
+platforms = ["win-64"]
+
+[dependencies]
+python = "3.12.*"
+
+[pypi-dependencies]
+gradio = "*"
+opencv-python-headless = "*"
+pypdf = "*"
+requests = "*"
+
+[tasks]
+dev = "uvicorn app:app --host 127.0.0.1 --port 7860"

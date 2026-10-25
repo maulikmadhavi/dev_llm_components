@@ -1,0 +1,12 @@
+[workspace]
+name = "reactflow_app"
+channels = ["conda-forge"]
+platforms = ["win-64"]
+
+[dependencies]
+nodejs = "22.*"
+
+[tasks]
+install = { cmd = "npm install", inputs = ["package.json", "package-lock.json"], outputs = ["node_modules/.package-lock.json"] }
+dev = { cmd = "npm run dev", depends-on = ["install"] }
+build = { cmd = "npm run build", depends-on = ["install"] }
