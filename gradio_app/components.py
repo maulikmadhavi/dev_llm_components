@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import csv
 import json
+import logging
 import math
 import re
 import shutil
@@ -18,6 +19,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 import requests
+
+log = logging.getLogger(__name__)
 
 UPLOAD_DIR = Path(__file__).parent / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -177,7 +180,12 @@ def chat(params: dict, content) -> str:
 
 
 def chat_messages(params: dict, messages: list[dict]) -> str:
-    """Send a full message list (system/user/assistant turns) and return the reply text."""
+    """Send a full message list (system/user/assistant turns) and return the reply text.
+
+    params may carry `timeout` (seconds, default 600) and `quiet_errors`: when set, failures are logged
+    here and the caller only sees a generic message, so error text cannot be used to probe the network.
+    """
+    quiet = params.get("quiet_errors")
     headers = {"Authorization": f"Bearer {params['api_key']}"} if params.get("api_key") else {}
     try:
         r = requests.post(
@@ -189,13 +197,22 @@ def chat_messages(params: dict, messages: list[dict]) -> str:
                 "max_tokens": int(params.get("max_tokens") or 512),
             },
             headers=headers,
-            timeout=600,
+            timeout=params.get("timeout") or 600,
         )
         r.raise_for_status()
         choice = r.json()["choices"][0]
         text = choice["message"]["content"] or ""
+    except requests.Timeout as e:
+        if not quiet:
+            raise NodeError(f"Model server error: {e}") from e
+        log.warning("model server timed out: %s", e)
+        raise NodeError("The model server took too long to reply. Try a smaller or faster model.") from e
     except (requests.RequestException, KeyError, IndexError, ValueError) as e:
-        raise NodeError(f"Model server error: {e}") from e
+        if not quiet:
+            raise NodeError(f"Model server error: {e}") from e
+        log.warning("model server error: %s", e)
+        raise NodeError("Could not get a reply from the model server. Check that it is running and the model name "
+                        "is right; the server log has the details.") from e
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
     if not text:
         hint = " The model ran out of tokens while thinking; raise Max tokens." if choice.get("finish_reason") == "length" else ""

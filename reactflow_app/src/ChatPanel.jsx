@@ -155,7 +155,7 @@ export default function ChatPanel({ onClose }) {
           <label className="block text-[11px] text-slate-600">Model
             <input className={inputCls} placeholder="qwen/qwen3-4b" value={settings.model ?? ''} onChange={(e) => updateSettings('model', e.target.value)} />
           </label>
-          <p className="text-[11px] text-slate-400">Any OpenAI-compatible server (LM Studio by default). Blank = server defaults.</p>
+          <p className="text-[11px] text-slate-400">Blank = the model server this backend is configured for. Other URLs need AGENT_ALLOW_CUSTOM_BASE_URL=1 on the backend.</p>
         </div>
       </details>
 

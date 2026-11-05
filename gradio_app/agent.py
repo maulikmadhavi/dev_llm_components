@@ -29,6 +29,7 @@ MAX_HISTORY = 10
 MAX_MESSAGE_CHARS = 4000
 OPS = {"add_node", "connect", "disconnect", "set_params", "remove_node", "arrange", "clear"}
 DEFAULT_BASE_URL = "http://localhost:1234/v1"
+DEFAULT_TIMEOUT = 120  # seconds; an abandoned chat keeps its server thread busy for at most this long
 # Settings the model may never change: pointing a node at another server would send that node's
 # browser-held API key and its inputs there on the next run.
 USER_ONLY_PARAMS = {"base_url"}
@@ -51,15 +52,26 @@ def agent_settings(raw: dict | None) -> dict:
     base_url = pick("base_url", "AGENT_BASE_URL", DEFAULT_BASE_URL)
     if not re.match(r"https?://", base_url):
         raise NodeError("Agent base URL must start with http:// or https://")
-    # The server's own key only goes to the server URL it was configured for, never to a caller-chosen one.
     configured = (os.environ.get("AGENT_BASE_URL") or DEFAULT_BASE_URL).strip().rstrip("/")
-    env_key = os.environ.get("AGENT_API_KEY", "") if base_url.rstrip("/") == configured else ""
+    is_configured = base_url.rstrip("/") == configured
+    # Any client that can reach /api/chat could otherwise make this server POST to an arbitrary host.
+    if not is_configured and os.environ.get("AGENT_ALLOW_CUSTOM_BASE_URL", "").lower() not in ("1", "true", "yes"):
+        raise NodeError("This server only talks to its configured assistant model server. "
+                        "The server admin can allow other URLs with AGENT_ALLOW_CUSTOM_BASE_URL=1.")
+    # The server's own key only goes to the server URL it was configured for, never to a caller-chosen one.
+    env_key = os.environ.get("AGENT_API_KEY", "") if is_configured else ""
+    try:
+        timeout = min(max(float(os.environ.get("AGENT_TIMEOUT") or DEFAULT_TIMEOUT), 5), 600)
+    except ValueError:
+        timeout = DEFAULT_TIMEOUT
     return {
         "base_url": base_url,
         "model": pick("model", "AGENT_MODEL", "qwen/qwen3-4b"),
         "api_key": str(raw.get("api_key") or env_key),
         "temperature": 0.2,
         "max_tokens": 3000,
+        "timeout": timeout,
+        "quiet_errors": True,
     }
 
 

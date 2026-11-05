@@ -3,6 +3,7 @@
 Run: pixi run dev  ->  http://127.0.0.1:7860  (Gradio)  and  /flow/ (drag & drop canvas, if built)
 LM Studio must be serving the models: lms server start --cors
 The canvas chat assistant (POST /api/chat) uses the same server; override with AGENT_BASE_URL / AGENT_MODEL.
+It only talks to that configured URL unless AGENT_ALLOW_CUSTOM_BASE_URL=1; AGENT_TIMEOUT (seconds, default 120) caps each call.
 """
 import base64
 import io

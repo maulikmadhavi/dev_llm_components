@@ -146,13 +146,70 @@ def test_input_validation():
 def test_env_api_key_is_only_sent_to_the_configured_server(monkeypatch):
     monkeypatch.setenv("AGENT_API_KEY", "server-secret")
     monkeypatch.setenv("AGENT_BASE_URL", "http://llm.internal/v1")
+    monkeypatch.setenv("AGENT_ALLOW_CUSTOM_BASE_URL", "1")  # opt in so another URL can be tried at all
     assert agent_settings({})["api_key"] == "server-secret"
     assert agent_settings({"base_url": "http://llm.internal/v1/"})["api_key"] == "server-secret"
-    assert agent_settings({"base_url": "http://evil.example/v1"})["api_key"] == ""
-    assert agent_settings({"base_url": "http://evil.example/v1", "api_key": "mine"})["api_key"] == "mine"
+    assert agent_settings({"base_url": "http://other.example/v1"})["api_key"] == ""
+    assert agent_settings({"base_url": "http://other.example/v1", "api_key": "mine"})["api_key"] == "mine"
     monkeypatch.delenv("AGENT_BASE_URL")
     assert agent_settings({})["api_key"] == "server-secret"  # default URL is the configured one
-    assert agent_settings({"base_url": "http://evil.example/v1"})["api_key"] == ""
+    assert agent_settings({"base_url": "http://other.example/v1"})["api_key"] == ""
+
+
+def test_caller_cannot_pick_another_model_server_unless_the_admin_opts_in(monkeypatch):
+    monkeypatch.delenv("AGENT_ALLOW_CUSTOM_BASE_URL", raising=False)
+    monkeypatch.delenv("AGENT_BASE_URL", raising=False)
+    assert agent_settings({"base_url": "http://localhost:1234/v1/"})["base_url"] == "http://localhost:1234/v1/"
+    for url in ("http://169.254.169.254/latest", "http://10.0.0.5:8080/v1", "https://evil.example/v1"):
+        with pytest.raises(NodeError, match="configured assistant model server"):
+            agent_settings({"base_url": url})
+    monkeypatch.setenv("AGENT_BASE_URL", "http://llm.internal/v1")
+    assert agent_settings({})["base_url"] == "http://llm.internal/v1"
+    with pytest.raises(NodeError):
+        agent_settings({"base_url": "http://localhost:1234/v1"})  # the old default is no longer the configured one
+    monkeypatch.setenv("AGENT_ALLOW_CUSTOM_BASE_URL", "true")
+    assert agent_settings({"base_url": "http://other.example/v1"})["base_url"] == "http://other.example/v1"
+
+
+def test_agent_calls_have_a_short_bounded_timeout(monkeypatch):
+    monkeypatch.delenv("AGENT_TIMEOUT", raising=False)
+    assert agent_settings({})["timeout"] == 120
+    for env, want in (("30", 30), ("1", 5), ("99999", 600), ("soon", 120)):
+        monkeypatch.setenv("AGENT_TIMEOUT", env)
+        assert agent_settings({})["timeout"] == want
+
+
+def test_chat_messages_uses_the_timeout_and_hides_error_details_from_the_agent_path(monkeypatch):
+    import requests
+
+    import components
+
+    seen = {}
+
+    def boom(url, **kw):
+        seen["timeout"] = kw["timeout"]
+        raise requests.ConnectionError("HTTPConnectionPool(host='10.0.0.5', port=8080): refused")
+
+    monkeypatch.setattr(components.requests, "post", boom)
+    params = {"base_url": "http://x/v1", "model": "m", "quiet_errors": True, "timeout": 7}
+    with pytest.raises(NodeError) as err:
+        components.chat_messages(params, [{"role": "user", "content": "hi"}])
+    assert seen["timeout"] == 7 and "10.0.0.5" not in str(err.value) and "refused" not in str(err.value)
+
+    def slow(url, **kw):
+        raise requests.Timeout("Read timed out (host 10.0.0.5)")
+
+    monkeypatch.setattr(components.requests, "post", slow)
+    with pytest.raises(NodeError, match="took too long") as err:
+        components.chat_messages(params, [{"role": "user", "content": "hi"}])
+    assert "10.0.0.5" not in str(err.value)
+    # ordinary nodes keep their detailed errors and the 10 minute default
+    with pytest.raises(NodeError, match="10.0.0.5"):
+        components.chat_messages({"base_url": "http://x/v1", "model": "m"}, [{"role": "user", "content": "hi"}])
+    monkeypatch.setattr(components.requests, "post", boom)
+    with pytest.raises(NodeError):
+        components.chat_messages({"base_url": "http://x/v1", "model": "m"}, [])
+    assert seen["timeout"] == 600
 
 
 def test_model_cannot_redirect_a_node_to_another_server():
