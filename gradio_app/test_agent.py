@@ -174,7 +174,7 @@ def test_caller_cannot_pick_another_model_server_unless_the_admin_opts_in(monkey
 def test_agent_calls_have_a_short_bounded_timeout(monkeypatch):
     monkeypatch.delenv("AGENT_TIMEOUT", raising=False)
     assert agent_settings({})["timeout"] == 120
-    for env, want in (("30", 30), ("1", 5), ("99999", 600), ("soon", 120)):
+    for env, want in (("30", 30), ("1", 5), ("99999", 600), ("inf", 120), ("nan", 120), ("soon", 120)):
         monkeypatch.setenv("AGENT_TIMEOUT", env)
         assert agent_settings({})["timeout"] == want
 

@@ -17,6 +17,7 @@ This project includes:
 vlm_application/     - Video and image processing with VLM APIs
 langchain/          - RAG and research agent workflows
 ASR/                - Speech recognition model training
+gradio_app/        - Node backend + React Flow canvas API (see gradio_app/README.md for chat assistant settings)
 finetuning/         - Model fine-tuning scripts
 n8n/                - Integration utilities
 asr_text_collection.py - ASR data collection

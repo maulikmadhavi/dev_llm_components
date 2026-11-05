@@ -61,9 +61,10 @@ def agent_settings(raw: dict | None) -> dict:
     # The server's own key only goes to the server URL it was configured for, never to a caller-chosen one.
     env_key = os.environ.get("AGENT_API_KEY", "") if is_configured else ""
     try:
-        timeout = min(max(float(os.environ.get("AGENT_TIMEOUT") or DEFAULT_TIMEOUT), 5), 600)
+        timeout = float(os.environ.get("AGENT_TIMEOUT") or DEFAULT_TIMEOUT)
     except ValueError:
         timeout = DEFAULT_TIMEOUT
+    timeout = min(max(timeout, 5), 600) if math.isfinite(timeout) else DEFAULT_TIMEOUT  # "nan" would dodge the clamp
     return {
         "base_url": base_url,
         "model": pick("model", "AGENT_MODEL", "qwen/qwen3-4b"),
