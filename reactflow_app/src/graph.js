@@ -49,6 +49,20 @@ export function serializeGraph(nodes, edges, specs) {
   };
 }
 
+/** True if `goal` can be reached from `start` by following edges downstream. */
+export function reaches(edges, start, goal) {
+  const seen = new Set();
+  const todo = [start];
+  while (todo.length) {
+    const id = todo.pop();
+    if (id === goal) return true;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    for (const e of edges) if (e.source === id) todo.push(e.target);
+  }
+  return false;
+}
+
 // ---------- layout ----------
 
 /** Rough rendered height of a node, used until React Flow has measured it. */
@@ -134,7 +148,7 @@ export function placeNew(nodes, edges, newIds, specs) {
  * Returns { nodes, edges, summary } where summary counts what changed.
  */
 export function applyActions(nodes, edges, actions, specs) {
-  const summary = { added: 0, connected: 0, configured: 0, removed: 0, arranged: false, cleared: false };
+  const summary = { added: 0, connected: 0, configured: 0, removed: 0, skipped: 0, arranged: false, cleared: false };
   const added = new Set();
   let shouldArrange = false;
   const find = (id) => nodes.find((n) => n.id === id);
@@ -155,6 +169,10 @@ export function applyActions(nodes, edges, actions, specs) {
         if (!src || !dst) break;
         const type = portType(specs, src, a.sourceHandle, 'outputs');
         if (!type || type !== portType(specs, dst, a.targetHandle, 'inputs')) break;
+        // The server checked for loops against the canvas it was sent; the user may have connected
+        // things since, so check again against the current edges (minus the one this input replaces).
+        const rest = edges.filter((e) => !(e.target === a.target && e.targetHandle === a.targetHandle));
+        if (reaches(rest, a.target, a.source)) { summary.skipped++; break; }
         edges = withEdge(edges, makeEdge(a, type));
         summary.connected++;
         break;
@@ -203,5 +221,6 @@ export function describeSummary(s) {
   if (s.configured) bits.push(`configured ${s.configured}`);
   if (s.removed) bits.push(`removed ${s.removed}`);
   if (s.arranged) bits.push('arranged');
+  if (s.skipped) bits.push(`skipped ${s.skipped} connection${s.skipped > 1 ? 's' : ''} that would make a loop`);
   return bits.join(' · ');
 }
