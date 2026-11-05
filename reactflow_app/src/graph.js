@@ -118,7 +118,8 @@ export function placeNew(nodes, edges, newIds, specs) {
   for (const n of todo) {
     const parents = edges.filter((e) => e.target === n.id && placed.has(e.source)).map((e) => placed.get(e.source));
     const x = parents.length ? Math.max(...parents.map((p) => p.position.x)) + colW : left;
-    const sameCol = [...placed.values()].filter((p) => Math.abs(p.position.x - x) < colW / 2);
+    // anything that horizontally overlaps this box, even a hand-placed node that is not in a tidy column
+    const sameCol = [...placed.values()].filter((p) => Math.abs(p.position.x - x) < NODE_WIDTH);
     const y = sameCol.length ? Math.max(...sameCol.map((p) => p.position.y + heightOf(p, specs))) + ROW_GAP : 0;
     placed.set(n.id, { ...n, position: { x, y } });
   }

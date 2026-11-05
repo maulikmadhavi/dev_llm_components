@@ -16,6 +16,7 @@ Action shapes returned to the canvas (all ids are concrete node ids):
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import uuid
@@ -27,6 +28,17 @@ MAX_ACTIONS = 40
 MAX_HISTORY = 10
 MAX_MESSAGE_CHARS = 4000
 OPS = {"add_node", "connect", "disconnect", "set_params", "remove_node", "arrange", "clear"}
+DEFAULT_BASE_URL = "http://localhost:1234/v1"
+# Settings the model may never change: pointing a node at another server would send that node's
+# browser-held API key and its inputs there on the next run.
+USER_ONLY_PARAMS = {"base_url"}
+# Nodes whose inputs are all optional but that need at least N of them wired to run.
+NEEDS_ANY_OF = {
+    "vlm": (("image", "chunks", "images", "videos"), 1),
+    "object_detector": (("image", "images"), 1),
+    "image_crop": (("detections", "image", "images"), 1),
+    "llm_decision_fusion": (("a", "b", "c", "results_a", "results_b", "results_c"), 2),
+}
 
 
 def agent_settings(raw: dict | None) -> dict:
@@ -36,13 +48,16 @@ def agent_settings(raw: dict | None) -> dict:
     def pick(key: str, env: str, default: str) -> str:
         return str(raw.get(key) or os.environ.get(env) or default).strip()
 
-    base_url = pick("base_url", "AGENT_BASE_URL", "http://localhost:1234/v1")
+    base_url = pick("base_url", "AGENT_BASE_URL", DEFAULT_BASE_URL)
     if not re.match(r"https?://", base_url):
         raise NodeError("Agent base URL must start with http:// or https://")
+    # The server's own key only goes to the server URL it was configured for, never to a caller-chosen one.
+    configured = (os.environ.get("AGENT_BASE_URL") or DEFAULT_BASE_URL).strip().rstrip("/")
+    env_key = os.environ.get("AGENT_API_KEY", "") if base_url.rstrip("/") == configured else ""
     return {
         "base_url": base_url,
         "model": pick("model", "AGENT_MODEL", "qwen/qwen3-4b"),
-        "api_key": str(raw.get("api_key") or os.environ.get("AGENT_API_KEY") or ""),
+        "api_key": str(raw.get("api_key") or env_key),
         "temperature": 0.2,
         "max_tokens": 3000,
     }
@@ -170,6 +185,19 @@ def _pick_ports(src: dict, dst: dict, out_name: str | None, in_name: str | None,
     return pairs[0] if pairs else None
 
 
+def _reaches(edges, start: str, goal: str) -> bool:
+    """True if `goal` can be reached from `start` by following edges downstream."""
+    seen, todo = set(), [start]
+    while todo:
+        node = todo.pop()
+        if node == goal:
+            return True
+        if node not in seen:
+            seen.add(node)
+            todo += [e[2] for e in edges if e[0] == node]
+    return False
+
+
 def _split_ref(text) -> tuple[str, str | None]:
     text = str(text or "").strip()
     node, _, port = text.rpartition(".")
@@ -184,7 +212,9 @@ def _coerce_param(spec_param: dict, value):
             return False, None
         try:
             num = float(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            return False, None
+        if not math.isfinite(num):  # "NaN" / "Infinity" / "1e999" parse, but cannot be sent back as JSON
             return False, None
         return True, int(num) if num.is_integer() else num
     if kind == "select":
@@ -201,7 +231,7 @@ def _clean_params(spec: dict, raw, notes: list[str]) -> dict:
         p = by_name.get(key)
         if p is None:
             notes.append(f"{spec['label']} has no setting '{key}'.")
-        elif p["kind"] in ("file", "password"):
+        elif p["kind"] in ("file", "password") or key in USER_ONLY_PARAMS:
             notes.append(f"'{p['label']}' on {spec['label']} must be filled in by you.")
         else:
             ok, coerced = _coerce_param(p, value)
@@ -225,7 +255,8 @@ def validate_actions(raw_actions, graph: dict, specs_by_type: dict) -> tuple[lis
 
     def resolve(name) -> str | None:
         name = str(name or "").strip()
-        return refs.get(name) or (name if name in nodes else None)
+        node_id = refs.get(name, name)
+        return node_id if node_id in nodes else None  # refs outlive remove_node / clear
 
     def drop_edges(pred):
         for e in [e for e in edges if pred(e)]:
@@ -238,12 +269,13 @@ def validate_actions(raw_actions, graph: dict, specs_by_type: dict) -> tuple[lis
 
     for act in raw_actions[:MAX_ACTIONS]:
         op = act.get("op") if isinstance(act, dict) else None
-        if op not in OPS:
+        if not isinstance(op, str) or op not in OPS:
             notes.append(f"Skipped an unknown action: {_short(act, 60)}")
             continue
 
         if op == "add_node":
-            spec = specs_by_type.get(act.get("type"))
+            node_type = act.get("type")
+            spec = specs_by_type.get(node_type) if isinstance(node_type, str) else None
             if spec is None:
                 notes.append(f"Skipped unknown node type '{act.get('type')}'.")
                 continue
@@ -278,6 +310,10 @@ def validate_actions(raw_actions, graph: dict, specs_by_type: dict) -> tuple[lis
                 notes.append(f"Cannot connect {src_spec['label']} to {dst_spec['label']}: no matching port types.")
                 continue
             out_p, in_p = pair
+            kept = {e for e in edges if not (e[2] == dst and e[3] == in_p["name"])}
+            if _reaches(kept, dst, src):
+                notes.append(f"Skipped connect: {src_spec['label']} -> {dst_spec['label']} would make a loop.")
+                continue
             drop_edges(lambda e: e[2] == dst and e[3] == in_p["name"])  # an input takes one connection
             edges.add((src, out_p["name"], dst, in_p["name"]))
             actions.append({"op": op, "source": src, "sourceHandle": out_p["name"], "target": dst, "targetHandle": in_p["name"]})
@@ -325,7 +361,11 @@ def lint(graph: dict, specs_by_type: dict) -> list[str]:
         for p in spec["inputs"]:
             if not p["optional"] and p["name"] not in wired:
                 issues.append(f"{name}: input '{p['name']}' ({p['type']}) is not connected.")
-        if spec["inputs"] and not wired and all(p["optional"] for p in spec["inputs"]):
+        if n["type"] in NEEDS_ANY_OF:
+            names, need = NEEDS_ANY_OF[n["type"]]
+            if len(wired & set(names)) < need:
+                issues.append(f"{name}: connect {'at least two' if need > 1 else 'one'} of its inputs ({', '.join(names)}).")
+        elif spec["inputs"] and not wired and all(p["optional"] for p in spec["inputs"]):
             issues.append(f"{name}: nothing is connected to its inputs ({', '.join(p['name'] for p in spec['inputs'])}).")
         for p in spec["params"]:
             value = n["params"].get(p["name"])
@@ -333,10 +373,12 @@ def lint(graph: dict, specs_by_type: dict) -> list[str]:
                 issues.append(f"{name}: no file uploaded for '{p['label']}'.")
             elif p["name"] == "folder" and not str(value or "").strip():
                 issues.append(f"{name}: '{p['label']}' is empty.")
-            elif p["name"] in ("prompt", "instruction") and not str(value or "").strip():
+            elif p["name"] == "prompt" and not str(value or "").strip():  # the VLM refuses to run without one
                 issues.append(f"{name}: '{p['label']}' is empty.")
         if n.get("status") == "error" and n.get("error"):
             issues.append(f"{name}: last run failed: {_short(n['error'], 160)}")
+    if any(_reaches({e for e in edges if e != x}, x[2], x[0]) for x in edges):
+        issues.append("The flow contains a loop, so Run flow will not start. Remove one of the connections in it.")
     return issues
 
 

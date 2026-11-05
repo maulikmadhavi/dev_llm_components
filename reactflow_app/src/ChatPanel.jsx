@@ -54,8 +54,25 @@ export default function ChatPanel({ onClose }) {
   const [busy, setBusy] = useState(false);
   const [settings, setSettings] = useState(loadSettings);
   const endRef = useRef(null);
+  // Each request gets a turn number; a reply only counts while its turn is still the current one.
+  const turn = useRef(0);
+  const abortRef = useRef(null);
 
   useEffect(() => { endRef.current?.scrollIntoView({ block: 'end' }); }, [messages, busy]);
+
+  const cancelPending = useCallback(() => {
+    turn.current += 1;
+    abortRef.current?.abort();
+    abortRef.current = null;
+  }, []);
+  // Closing the panel unmounts it: drop the pending request so it cannot edit the canvas unseen.
+  useEffect(() => cancelPending, [cancelPending]);
+
+  const newChat = () => {
+    cancelPending();
+    setMessages([]);
+    setBusy(false);
+  };
 
   const updateSettings = (key, value) => setSettings((s) => {
     const next = { ...s, [key]: value };
@@ -67,12 +84,17 @@ export default function ChatPanel({ onClose }) {
     const content = text.trim();
     if (!content || busy) return;
     const history = [...messages, { role: 'user', content }];
+    cancelPending();
+    const id = turn.current;
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
     setMessages(history);
     setInput('');
     setBusy(true);
     try {
       const wire = history.filter((m) => !m.error).map(({ role, content: c }) => ({ role, content: c }));
-      const res = await chatApi(wire, serializeGraph(getNodes(), getEdges(), specs), settings);
+      const res = await chatApi(wire, serializeGraph(getNodes(), getEdges(), specs), settings, ctrl.signal);
+      if (turn.current !== id) return; // chat was reset or closed while waiting
       // Re-read the canvas: the user may have moved or deleted nodes while the model was thinking.
       const out = applyActions(getNodes(), getEdges(), res.actions ?? [], specs);
       if (res.actions?.length) {
@@ -84,11 +106,12 @@ export default function ChatPanel({ onClose }) {
         role: 'assistant', content: res.reply, applied: describeSummary(out.summary), notes: res.notes, issues: res.issues,
       }]);
     } catch (err) {
+      if (turn.current !== id) return;
       setMessages((m) => [...m, { role: 'assistant', error: true, content: err.message || String(err) }]);
     } finally {
-      setBusy(false);
+      if (turn.current === id) setBusy(false);
     }
-  }, [busy, messages, settings, specs, getNodes, getEdges, setNodes, setEdges, fitView]);
+  }, [busy, messages, settings, specs, cancelPending, getNodes, getEdges, setNodes, setEdges, fitView]);
 
   return (
     <aside className="flex h-full w-96 shrink-0 flex-col border-l border-slate-200 bg-white" aria-label="Flow assistant">
@@ -96,7 +119,7 @@ export default function ChatPanel({ onClose }) {
         <h2 className="text-sm font-semibold text-slate-800">💬 Flow assistant</h2>
         <div className="flex items-center gap-2">
           {messages.length > 0 && (
-            <button type="button" onClick={() => setMessages([])} className="text-xs text-slate-500 hover:text-slate-800">New chat</button>
+            <button type="button" onClick={newChat} className="text-xs text-slate-500 hover:text-slate-800">New chat</button>
           )}
           <button type="button" aria-label="Close assistant" onClick={onClose} className="rounded px-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700">✕</button>
         </div>
