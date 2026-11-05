@@ -11,6 +11,8 @@ gradio = "*"
 opencv-python-headless = "*"
 pypdf = "*"
 requests = "*"
+pytest = "*"
 
 [tasks]
 dev = "uvicorn app:app --host 127.0.0.1 --port 7860"
+test = "pytest test_agent.py -q"

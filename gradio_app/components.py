@@ -173,6 +173,11 @@ def chat(params: dict, content) -> str:
     if params.get("system"):
         messages.append({"role": "system", "content": params["system"]})
     messages.append({"role": "user", "content": content})
+    return chat_messages(params, messages)
+
+
+def chat_messages(params: dict, messages: list[dict]) -> str:
+    """Send a full message list (system/user/assistant turns) and return the reply text."""
     headers = {"Authorization": f"Bearer {params['api_key']}"} if params.get("api_key") else {}
     try:
         r = requests.post(

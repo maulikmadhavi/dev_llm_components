@@ -37,3 +37,11 @@ export async function runNodeApi(type, params, inputs) {
   });
   return json.outputs ?? {};
 }
+
+/** One agent turn: { reply, actions, notes, issues }. `messages` ends with the new user request. */
+export const chatApi = (messages, graph, settings) =>
+  request('/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messages, graph, settings }),
+  });
