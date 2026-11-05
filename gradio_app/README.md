@@ -27,6 +27,8 @@ Configure it with environment variables on the process that runs `pixi run dev`.
 
 Setting them:
 
+The PowerShell example is included because `pixi.toml` targets Windows (`win-64`).
+
 ```bash
 # bash
 AGENT_BASE_URL=http://llm.internal:8000/v1 AGENT_API_KEY=... AGENT_TIMEOUT=60 pixi run dev
