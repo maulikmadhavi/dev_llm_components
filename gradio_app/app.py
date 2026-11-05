@@ -2,6 +2,8 @@
 
 Run: pixi run dev  ->  http://127.0.0.1:7860  (Gradio)  and  /flow/ (drag & drop canvas, if built)
 LM Studio must be serving the models: lms server start --cors
+The canvas chat assistant (POST /api/chat) uses the same server; override with AGENT_BASE_URL / AGENT_MODEL.
+It only talks to that configured URL unless AGENT_ALLOW_CUSTOM_BASE_URL=1; AGENT_TIMEOUT (seconds, default 120) caps each call.
 """
 import base64
 import io
@@ -16,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageDraw
 from pydantic import BaseModel, Field
 
+from agent import run_agent
 from components import OUTPUT_DIR, NodeError, media_path, run_node, save_upload, specs
 
 FLOW_DIST = Path(__file__).parent.parent / "reactflow_app" / "dist"
@@ -36,6 +39,12 @@ class RunRequest(BaseModel):
     type: str
     params: dict = Field(default_factory=dict)
     inputs: dict = Field(default_factory=dict)
+
+
+class ChatRequest(BaseModel):
+    messages: list[dict]  # [{role: "user" | "assistant", content: str}], last one is the new request
+    graph: dict = Field(default_factory=dict)  # current canvas: {nodes: [...], edges: [...]}
+    settings: dict = Field(default_factory=dict)  # optional {base_url, model, api_key} for the agent LLM
 
 
 @api.get("/api/nodes")
@@ -70,6 +79,15 @@ def download_output(name: str):
 def run(req: RunRequest):
     try:
         return {"outputs": run_node(req.type, req.params, req.inputs)}
+    except NodeError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@api.post("/api/chat")
+def chat_with_agent(req: ChatRequest):
+    """Let the agent read the canvas and answer with validated edits (add/connect/configure/arrange)."""
+    try:
+        return run_agent(req.model_dump(), specs())
     except NodeError as e:
         raise HTTPException(400, str(e)) from e
 
